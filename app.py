@@ -102,14 +102,12 @@ def index():
     )
 
 @socketio.on('generate')
-def generateQR(data):
+def generateQR(inputDebt, otherName, userName):
     try:
-        # Extract data properly
-        inputDebt = float(data.get('inputDebt', 0))
-        otherName = data.get('otherName', '')
-        userName = data.get('userName', '')
-        
         print(f"Generating QR for: Debt={inputDebt}, Other={otherName}, User={userName}")
+        
+        # Convert and validate inputs
+        inputDebt = float(inputDebt)
         
         # Validate inputs
         if not inputDebt or inputDebt <= 0:
@@ -292,12 +290,12 @@ def addHistory(data):
     save(userCredentials, toConfirmTransaction, transactions, userData)
 
 @socketio.on('newDebtPay')
-def debtPay(data):
+def debtPay(who, much):
     global debtPayList
     
     try:
-        who = data.get('who', '')
-        much = float(data.get('much', 0))
+        # Convert amount to float
+        much = float(much)
         
         print(f"Debt payment request: {who} wants to pay {much}")
         
@@ -320,7 +318,7 @@ def debtPay(data):
         if who in active_users and other_user in active_users:
             # Reset debtPayList to allow new debt payment
             debtPayList = [who, much, 0]
-            emit("verifyDebt", {'who': who, 'amount': much}, broadcast=True)
+            emit("verifyDebt", (who, much), broadcast=True)
             emit('debtPaySuccess', {'message': 'Debt payment request sent'})
         else:
             emit('debtPayError', {'message': 'Both users must be online to process debt payments'})
@@ -377,12 +375,12 @@ def addHistoryDebt(who, amount):
     save(userCredentials, toConfirmTransaction, transactions, userData)
 
 @socketio.on('confirmDebtPay')
-def confirmDebtPay(data):
+def confirmDebtPay(who, whom):
     global debtPayList
     
     try:
-        who = data.get('who', '')
-        amount = float(data.get('amount', 0))
+        # Convert amount to float
+        whom = float(whom)
         
         if debtPayList is None:
             emit('debtPayError', {'message': 'No debt payment request found'})
@@ -393,7 +391,7 @@ def confirmDebtPay(data):
 
         if debtPayList[2] >= 2:
             print("TOTALLY CONFIRMED")
-            addHistoryDebt(who, amount)
+            addHistoryDebt(who, whom)
             
             # Reset debtPayList to allow new requests
             debtPayList = None
