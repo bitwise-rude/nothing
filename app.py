@@ -2,6 +2,8 @@ from flask import Flask, render_template, session, redirect, url_for, request, f
 from datetime import datetime, date
 from flask_socketio import SocketIO, emit, join_room, leave_room
 import qrcode
+import json
+import os
 from memory import *
 
 app = Flask(__name__)
@@ -100,17 +102,71 @@ def index():
     )
 
 @socketio.on('generate')
-def generateQR(inputDebt, otherName, userName):
-    print(inputDebt, otherName, userName)
-    toGenerate = {
-        "bankCode": "GLBBNPKA",
-        "accountName": userData[otherName]['accountName'],
-        "accountNumber": userData[otherName]['accountNumber'],
-        "amount": inputDebt,
-        "remarks": "Debt Paid to " + otherName
-    }
-    qrcode.make(json.dumps(toGenerate)).save('static\\' + userName + ".png")
-    emit('onGenerate')
+def generateQR(data):
+    try:
+        # Extract data properly
+        inputDebt = float(data.get('inputDebt', 0))
+        otherName = data.get('otherName', '')
+        userName = data.get('userName', '')
+        
+        print(f"Generating QR for: Debt={inputDebt}, Other={otherName}, User={userName}")
+        
+        # Validate inputs
+        if not inputDebt or inputDebt <= 0:
+            emit('qrError', {'message': 'Invalid debt amount'})
+            return
+            
+        if not otherName or otherName not in userData:
+            emit('qrError', {'message': 'Invalid recipient'})
+            return
+        
+        # Format amount properly (ensure 2 decimal places for currency)
+        formatted_amount = "{:.2f}".format(inputDebt)
+        
+        # Create QR code data
+        toGenerate = {
+            "bankCode": "GLBBNPKA",
+            "accountName": userData[otherName]['accountName'],
+            "accountNumber": userData[otherName]['accountNumber'],
+            "amount": formatted_amount,  # Use formatted amount
+            "remarks": f"Debt Payment to {otherName}"
+        }
+        
+        # Ensure static directory exists
+        static_dir = 'static'
+        if not os.path.exists(static_dir):
+            os.makedirs(static_dir)
+        
+        # Generate QR code with proper JSON formatting
+        qr_data = json.dumps(toGenerate, separators=(',', ':'))  # Compact JSON
+        qr_code = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=10,
+            border=4,
+        )
+        qr_code.add_data(qr_data)
+        qr_code.make(fit=True)
+        
+        # Create QR code image
+        qr_image = qr_code.make_image(fill_color="black", back_color="white")
+        qr_filename = f"{userName}_payment.png"
+        qr_path = os.path.join(static_dir, qr_filename)
+        qr_image.save(qr_path)
+        
+        print(f"QR code saved to: {qr_path}")
+        print(f"QR code data: {qr_data}")
+        
+        emit('onGenerate', {
+            'success': True, 
+            'filename': qr_filename,
+            'amount': formatted_amount,
+            'recipient': otherName
+        })
+        
+    except Exception as e:
+        print(f"Error generating QR code: {str(e)}")
+        emit('qrError', {'message': f'Failed to generate QR code: {str(e)}'})
 
 @socketio.on('connect')
 def handle_connect():
@@ -189,45 +245,89 @@ def deleteTransaction(transaction_id):
 
 def addHistory(data):
     transactions.append(data)
-    for stfs in userData.keys():
-        if stfs == data['username']:
-            doer = data['username']
+    
+    # Get the two users
+    doer = data['username']
+    other = None
+    for username in userData.keys():
+        if username != doer:
+            other = username
+            break
+    
+    if not other:
+        print("Error: Could not find other user")
+        return
+    
+    # Calculate debt changes
+    total_amount = float(data['amount'])
+    user_paid = float(data['yourPay'])
+    fair_share = total_amount / 2
+    
+    print(f"Transaction: Total={total_amount}, UserPaid={user_paid}, FairShare={fair_share}")
+    
+    # Calculate who owes what
+    if user_paid > fair_share:
+        # User paid more than their share, other user owes them
+        amount_owed = user_paid - fair_share
+        userData[other]['toPay'] += amount_owed
+        print(f"{other} now owes {doer} an additional {amount_owed}")
+    elif user_paid < fair_share:
+        # User paid less than their share, user owes the other
+        amount_owed = fair_share - user_paid
+        userData[doer]['toPay'] += amount_owed
+        print(f"{doer} now owes {other} an additional {amount_owed}")
+    # If user_paid == fair_share, no debt change needed
+    
+    # Debt netting - if both users owe each other, net them out
+    if userData[doer]['toPay'] > 0 and userData[other]['toPay'] > 0:
+        if userData[doer]['toPay'] >= userData[other]['toPay']:
+            userData[doer]['toPay'] -= userData[other]['toPay']
+            userData[other]['toPay'] = 0
+            print(f"After netting: {doer} owes {userData[doer]['toPay']}, {other} owes 0")
         else:
-            other = stfs
-    if data['amount'] / 2 > data['yourPay']:
-        userData[doer]['toPay'] += abs(data['amount'] / 2 - data['yourPay'])
-    elif data['amount'] / 2 < data['yourPay']:
-        userData[other]['toPay'] += abs(data['amount'] / 2 - data['yourPay'])
-    
-    # check for debt re matching
-    if userData[doer]['toPay'] >= userData[other]['toPay'] and (userData[doer]['toPay'] != 0 and userData[other]['toPay'] != 0):
-        userData[doer]['toPay'] = userData[doer]['toPay'] - userData[other]['toPay']
-        userData[other]['toPay'] = 0
-    
-    if userData[other]['toPay'] >= userData[doer]['toPay'] and (userData[doer]['toPay'] != 0 and userData[other]['toPay'] != 0):
-        userData[other]['toPay'] = userData[other]['toPay'] - userData[doer]['toPay']
-        userData[doer]['toPay'] = 0
+            userData[other]['toPay'] -= userData[doer]['toPay']
+            userData[doer]['toPay'] = 0
+            print(f"After netting: {doer} owes 0, {other} owes {userData[other]['toPay']}")
     
     save(userCredentials, toConfirmTransaction, transactions, userData)
 
 @socketio.on('newDebtPay')
-def debtPay(who, much):
+def debtPay(data):
     global debtPayList
     
-    # Check if both users are active
-    other_user = None
-    for username in userData.keys():
-        if username != who:
-            other_user = username
-            break
-    
-    if who in active_users and other_user in active_users:
-        # Reset debtPayList to allow new debt payment
-        debtPayList = [who, much, 0]
-        emit("verifyDebt", (who, much), broadcast=True)
-        return {"success": True, "message": "Debt payment request sent"}
-    else:
-        return {"success": False, "message": "Both users must be online to process debt payments"}
+    try:
+        who = data.get('who', '')
+        much = float(data.get('much', 0))
+        
+        print(f"Debt payment request: {who} wants to pay {much}")
+        
+        if much <= 0:
+            emit('debtPayError', {'message': 'Invalid payment amount'})
+            return
+        
+        # Check if user has enough debt to pay
+        if userData[who]['toPay'] < much:
+            emit('debtPayError', {'message': f'You only owe {userData[who]["toPay"]:.2f}'})
+            return
+        
+        # Check if both users are active
+        other_user = None
+        for username in userData.keys():
+            if username != who:
+                other_user = username
+                break
+        
+        if who in active_users and other_user in active_users:
+            # Reset debtPayList to allow new debt payment
+            debtPayList = [who, much, 0]
+            emit("verifyDebt", {'who': who, 'amount': much}, broadcast=True)
+            emit('debtPaySuccess', {'message': 'Debt payment request sent'})
+        else:
+            emit('debtPayError', {'message': 'Both users must be online to process debt payments'})
+            
+    except Exception as e:
+        print(f"Error in debt payment: {str(e)}")
+        emit('debtPayError', {'message': 'Invalid payment data'})
 
 @socketio.on('confirmTransaction')
 def confirmTransaction(data):
@@ -259,41 +359,55 @@ def rejectTransaction(data):
     
     return {"success": False, "message": "Transaction not found"}
 
-def addHistoryDebt(who, whom):
+def addHistoryDebt(who, amount):
+    # Add debt payment to transaction history
     transactions.append({
         "date": str(datetime.now()),
         "username": who,
         "title": 'Debt Payment',
-        "amount": whom,
+        "amount": amount,
         "remarks": "Debt payment",
-        'yourPay': 0,
+        'yourPay': amount,  # They paid the full amount since it's a debt payment
     })
-    userData[who]['toPay'] -= whom
+    
+    # Reduce the debt
+    userData[who]['toPay'] = max(0, userData[who]['toPay'] - amount)
+    print(f"{who} paid {amount}, remaining debt: {userData[who]['toPay']}")
+    
     save(userCredentials, toConfirmTransaction, transactions, userData)
 
 @socketio.on('confirmDebtPay')
-def confirmDebtPay(who, whom):
+def confirmDebtPay(data):
     global debtPayList
     
-    if debtPayList is None:
-        return {"success": False, "message": "No debt payment request found"}
-    
-    print("CONFIRMED by 1")
-    debtPayList[2] += 1 
+    try:
+        who = data.get('who', '')
+        amount = float(data.get('amount', 0))
+        
+        if debtPayList is None:
+            emit('debtPayError', {'message': 'No debt payment request found'})
+            return
+        
+        print("CONFIRMED by 1")
+        debtPayList[2] += 1 
 
-    if debtPayList[2] >= 2:
-        print("TOTALLY CONFIRMED")
-        addHistoryDebt(who, whom)
-        
-        # Reset debtPayList to allow new requests
-        debtPayList = None
-        
-        # Reload to refresh
-        emit("refresh", broadcast=True)
-        save(userCredentials, toConfirmTransaction, transactions, userData)
-        return {"success": True, "message": "Debt payment confirmed"}
-    
-    return {"success": True, "message": "Waiting for final confirmation"}
+        if debtPayList[2] >= 2:
+            print("TOTALLY CONFIRMED")
+            addHistoryDebt(who, amount)
+            
+            # Reset debtPayList to allow new requests
+            debtPayList = None
+            
+            # Reload to refresh
+            emit("refresh", broadcast=True)
+            save(userCredentials, toConfirmTransaction, transactions, userData)
+            emit('debtPaySuccess', {'message': 'Debt payment confirmed'})
+        else:
+            emit('debtPaySuccess', {'message': 'Waiting for final confirmation'})
+            
+    except Exception as e:
+        print(f"Error confirming debt payment: {str(e)}")
+        emit('debtPayError', {'message': 'Error processing debt payment'})
 
 @socketio.on('rejectDebtPay')
 def rejectDebtPay():
@@ -303,10 +417,9 @@ def rejectDebtPay():
         # Reset debtPayList to allow new requests
         debtPayList = None
         emit("debtPayRejected", broadcast=True)
-        return {"success": True, "message": "Debt payment rejected"}
-    
-    return {"success": False, "message": "No debt payment request found"}
-
+        emit('debtPaySuccess', {'message': 'Debt payment rejected'})
+    else:
+        emit('debtPayError', {'message': 'No debt payment request found'})
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
